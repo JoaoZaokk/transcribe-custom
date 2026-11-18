@@ -610,7 +610,11 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         // Flash attention is the default. TRANSCRIBE_NO_FLASH selects the F32
         // mul_mat + soft_max path used by CPU tensor validation; flash casts
         // the relative-position mask to F16. Parakeet has no attention decoder.
-        bool enc_use_flash = true, dec_use_flash = false;
+        const bool is_metal_enc = backend_name != nullptr &&
+                                  (std::strstr(backend_name, "MTL") != nullptr ||
+                                   std::strstr(backend_name, "Metal") != nullptr ||
+                                   std::strstr(backend_name, "metal") != nullptr);
+        bool enc_use_flash = !is_metal_enc, dec_use_flash = false;
         transcribe::flash::apply_env_overrides(enc_use_flash, dec_use_flash);
         // Only where the backend fuses the per-head rel-pos mask (not CUDA).
         if (enc_use_flash && !transcribe::env::flag("TRANSCRIBE_FORCE_FLASH") &&
@@ -942,7 +946,11 @@ EncoderBuild build_encoder_graph_streaming(ggml_context *            ctx,
     // On CPU at streaming geometry the flash kernel is dramatically slower
     // (~33 ms/layer vs ~1 ms on a Cortex-A55). Parakeet has no attention
     // decoder, so the decoder flag is a throwaway.
-    bool enc_use_flash = true, dec_use_flash = false;
+    const bool is_metal_enc = backend_name != nullptr &&
+                              (std::strstr(backend_name, "MTL") != nullptr ||
+                               std::strstr(backend_name, "Metal") != nullptr ||
+                               std::strstr(backend_name, "metal") != nullptr);
+    bool enc_use_flash = !is_metal_enc, dec_use_flash = false;
     transcribe::flash::apply_env_overrides(enc_use_flash, dec_use_flash);
     // Only where the backend fuses the per-head rel-pos mask (not CUDA).
     if (enc_use_flash && !transcribe::env::flag("TRANSCRIBE_FORCE_FLASH") &&

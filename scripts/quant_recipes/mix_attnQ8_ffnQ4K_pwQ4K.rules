@@ -1,0 +1,8 @@
+# Mixed-Precision Recipe: mix_attnQ8_ffnQ4K_pwQ4K (Fast Sub-700ms Hybrid, 406.8 MiB w/ PT+EN vocab surgery)
+role:pre_encode.conv=F16
+role:pre_encode.out=Q8_0
+blocks:0-23:attn=Q8_0
+blocks:0-23:ffn=Q4_K
+blocks:0-23:pw=Q4_K
+role:pred=Q8_0
+role:joint=Q8_0

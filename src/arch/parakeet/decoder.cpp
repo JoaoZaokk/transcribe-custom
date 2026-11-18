@@ -794,7 +794,14 @@ static bool joint_batch_check_enabled() {
 // Resolve a decode thread count: n_threads <= 0 means "auto" →
 // default_n_threads(), matching the encoder.
 static int resolve_decode_threads(int n_threads) {
-    return n_threads > 0 ? n_threads : transcribe::default_n_threads();
+    if (n_threads > 0) {
+        return n_threads;
+    }
+#ifdef __APPLE__
+    return 1;
+#else
+    return transcribe::default_n_threads();
+#endif
 }
 
 transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDecoderWeights & out) {
@@ -2004,7 +2011,7 @@ ParakeetDeviceDecoder * parakeet_device_decoder_new(const HostDecoderWeights & w
     // so the logits move further from the CPU decoder's than summation order
     // alone does.
     const char * wmode  = transcribe::env::str("TRANSCRIBE_PARAKEET_DEVICE_DECODER_WEIGHTS");
-    bool         native = model_weights != nullptr && wmode != nullptr && std::strcmp(wmode, "native") == 0;
+    bool         native = model_weights != nullptr && (wmode == nullptr || std::strcmp(wmode, "f32") != 0);
     auto         on_dev = [dev](const ggml_tensor * t) {
         return t != nullptr && t->buffer != nullptr &&
                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer)) == dev &&
@@ -2208,7 +2215,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights &   w,
     }
     // Frame-batched joint window (see JointGraphBatch). A batch-graph build
     // failure silently falls back to the serial path — never a decode error.
-    const int       batch_W = resolve_joint_batch_w(/*default_w=*/1);
+    const int       batch_W = resolve_joint_batch_w(/*default_w=*/16);
     JointGraphBatch jgb;
     if (batch_W > 1) {
         build_joint_graph_batch(jgb, w.joint, pg.backend, batch_W);

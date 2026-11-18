@@ -1,0 +1,6 @@
+# Recipe: uni_Q4_K_M_pw2d (356.5 MiB w/ PT+EN vocab surgery)
+# Usage:
+#   transcribe-quantize parakeet-ultra-pten-F16.gguf parakeet-ultra-pten-Q4_K_M-pw2d.gguf \
+#     --quant Q4_K_M --squeeze-pw --rules scripts/quant_recipes/uni_Q4_K_M_pw2d.rules
+
+role:pre_encode.conv=F16

@@ -1,0 +1,6 @@
+# Recipe: uni_Q8_0_pw2d (634.8 MiB w/ PT+EN vocab surgery)
+# Usage:
+#   transcribe-quantize parakeet-ultra-pten-F16.gguf parakeet-ultra-pten-Q8_0-pw2d.gguf \
+#     --quant Q8_0 --squeeze-pw --rules scripts/quant_recipes/uni_Q8_0_pw2d.rules
+
+role:pre_encode.conv=F16

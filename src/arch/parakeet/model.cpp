@@ -1018,10 +1018,11 @@ static ParakeetDeviceDecoder * session_device_decoder(ParakeetSession * pc, cons
     const bool         integrated = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
     const auto         kind       = pm->plan.primary_kind;
     const bool         default_gpu =
-        !integrated && (kind == transcribe::BackendKind::Cuda || kind == transcribe::BackendKind::Rocm ||
-                        kind == transcribe::BackendKind::Vulkan);
-    const bool other_gpu = integrated || kind == transcribe::BackendKind::Metal ||
-                           kind == transcribe::BackendKind::Sycl || kind == transcribe::BackendKind::OtherGpu;
+        kind == transcribe::BackendKind::Metal ||
+        (!integrated && (kind == transcribe::BackendKind::Cuda || kind == transcribe::BackendKind::Rocm ||
+                         kind == transcribe::BackendKind::Vulkan));
+    const bool other_gpu = integrated || kind == transcribe::BackendKind::Sycl ||
+                           kind == transcribe::BackendKind::OtherGpu;
     if (forced_off || !(default_gpu || (forced_on && other_gpu))) {
         if (integrated && !forced_off) {
             log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,

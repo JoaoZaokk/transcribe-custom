@@ -1,0 +1,22 @@
+# Mixed-Precision Recipe: mix_sweet_edgeQ5K_415 (Per-Layer Edge-Sandwich, 416.8 MiB w/ PT+EN vocab surgery)
+# Outer Conformer blocks (0-5, 20-23) keep ff1 at Q5_K; middle blocks (6-19) drop ff1 to Q4_K.
+# Usage:
+#   transcribe-quantize parakeet-ultra-pten-F16.gguf parakeet-ultra-pten-edge-Q8_0-Q5_K-Q4_K.gguf \
+#     --quant Q4_K_M --squeeze-pw --rules scripts/quant_recipes/mix_sweet_edgeQ5K_415.rules
+
+role:pre_encode.conv=F16
+role:pre_encode.out=Q8_0
+blocks:0-5:attn=Q8_0
+blocks:0-5:ff1=Q5_K
+blocks:0-5:ff2=Q4_K
+blocks:0-5:pw=Q4_K
+blocks:20-23:attn=Q8_0
+blocks:20-23:ff1=Q5_K
+blocks:20-23:ff2=Q4_K
+blocks:20-23:pw=Q4_K
+blocks:6-19:attn=Q8_0
+blocks:6-19:ff1=Q4_K
+blocks:6-19:ff2=Q4_K
+blocks:6-19:pw=Q4_K
+role:pred=Q8_0
+role:joint=Q8_0

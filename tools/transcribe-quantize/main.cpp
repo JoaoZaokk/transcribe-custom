@@ -26,22 +26,250 @@
 #include "policy.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+using transcribe::quantize::Bucket;
+using transcribe::quantize::classify_tensor;
 using transcribe::quantize::find_preset;
 using transcribe::quantize::Preset;
 using transcribe::quantize::preset_table;
 using transcribe::quantize::resolve_target_type;
 
 namespace {
+
+std::string trim_copy(const std::string & s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace((unsigned char) s[b])) {
+        ++b;
+    }
+    size_t e = s.size();
+    while (e > b && std::isspace((unsigned char) s[e - 1])) {
+        --e;
+    }
+    return s.substr(b, e - b);
+}
+
+bool iequals_str(const std::string & a, const char * b) {
+    const size_t n = std::strlen(b);
+    if (a.size() != n) {
+        return false;
+    }
+    for (size_t idx = 0; idx < n; ++idx) {
+        if (std::tolower((unsigned char) a[idx]) != std::tolower((unsigned char) b[idx])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parse_ggml_type_name(const std::string & tok, ggml_type & out) {
+    struct Entry {
+        const char * name;
+        ggml_type    type;
+    };
+    static constexpr Entry kTypes[] = {
+        { "F32",      GGML_TYPE_F32      },
+        { "F16",      GGML_TYPE_F16      },
+        { "BF16",     GGML_TYPE_BF16     },
+        { "Q8_0",     GGML_TYPE_Q8_0     },
+        { "Q6_K",     GGML_TYPE_Q6_K     },
+        { "Q5_K",     GGML_TYPE_Q5_K     },
+        { "Q5_0",     GGML_TYPE_Q5_0     },
+        { "Q5_1",     GGML_TYPE_Q5_1     },
+        { "Q4_K",     GGML_TYPE_Q4_K     },
+        { "Q4_0",     GGML_TYPE_Q4_0     },
+        { "Q4_1",     GGML_TYPE_Q4_1     },
+        { "Q3_K",     GGML_TYPE_Q3_K     },
+        { "Q2_K",     GGML_TYPE_Q2_K     },
+        { "Q2_0",     GGML_TYPE_Q2_0     },
+        { "MXFP4",    GGML_TYPE_MXFP4    },
+        { "IQ4_NL",   GGML_TYPE_IQ4_NL   },
+        { "IQ4_XS",   GGML_TYPE_IQ4_XS   },
+        { "TQ2_0",    GGML_TYPE_TQ2_0    },
+        { "TQ1_G128", GGML_TYPE_TQ1_G128 },
+    };
+    for (const Entry & ent : kTypes) {
+        if (iequals_str(tok, ent.name)) {
+            out = ent.type;
+            return true;
+        }
+    }
+    return false;
+}
+
+struct MixRule {
+    std::string pattern;
+    ggml_type   type = GGML_TYPE_COUNT;
+};
+
+bool is_conformer_pw_name(const std::string & name) {
+    return name.find("enc.blocks.") != std::string::npos &&
+           (name.rfind(".conv.pointwise1.weight") != std::string::npos ||
+            name.rfind(".conv.pointwise2.weight") != std::string::npos);
+}
+
+bool match_block_role(const std::string & rest, const std::string & role) {
+    if (role == "all") {
+        return (rest.find("ff1.") == 0 || rest.find("ff2.") == 0 || rest.find("attn.") == 0 ||
+                rest == "conv.pointwise1.weight" || rest == "conv.pointwise2.weight") &&
+               rest.find("pos_bias_") == std::string::npos;
+    }
+    if (role == "ffn") {
+        return rest == "ff1.linear1.weight" || rest == "ff1.linear2.weight" || rest == "ff2.linear1.weight" ||
+               rest == "ff2.linear2.weight";
+    }
+    if (role == "ff1") {
+        return rest == "ff1.linear1.weight" || rest == "ff1.linear2.weight";
+    }
+    if (role == "ff2") {
+        return rest == "ff2.linear1.weight" || rest == "ff2.linear2.weight";
+    }
+    if (role == "attn") {
+        return rest.find("attn.linear_") == 0;
+    }
+    if (role == "attn_qkv") {
+        return rest == "attn.linear_q.weight" || rest == "attn.linear_k.weight" || rest == "attn.linear_v.weight";
+    }
+    if (role == "attn_out") {
+        return rest == "attn.linear_out.weight";
+    }
+    if (role == "attn_pos") {
+        return rest == "attn.linear_pos.weight";
+    }
+    if (role == "pw") {
+        return rest == "conv.pointwise1.weight" || rest == "conv.pointwise2.weight";
+    }
+    if (role == "pw1") {
+        return rest == "conv.pointwise1.weight";
+    }
+    if (role == "pw2") {
+        return rest == "conv.pointwise2.weight";
+    }
+    if (role == "dw") {
+        return rest == "conv.depthwise.weight";
+    }
+    return false;
+}
+
+bool match_mix_rule(const std::string & name, Bucket base_bucket, const std::string & pat) {
+    if (pat.rfind("force:", 0) == 0) {
+        return name.find(pat.substr(6)) != std::string::npos;
+    }
+    if (pat.rfind("exact:", 0) == 0) {
+        return name == pat.substr(6);
+    }
+    if (base_bucket == Bucket::Norm) {
+        return false;
+    }
+    if (pat.rfind("blocks:", 0) == 0) {
+        // blocks:A-B:ROLE or blocks:A:ROLE
+        const std::string spec = pat.substr(7);
+        const size_t      colon = spec.find(':');
+        if (colon == std::string::npos) {
+            return false;
+        }
+        const std::string range_s = spec.substr(0, colon);
+        const std::string role_s  = spec.substr(colon + 1);
+        int               lo = -1, hi = -1;
+        const size_t      dash = range_s.find('-');
+        if (dash == std::string::npos) {
+            lo = hi = std::atoi(range_s.c_str());
+        } else {
+            lo = std::atoi(range_s.substr(0, dash).c_str());
+            hi = std::atoi(range_s.substr(dash + 1).c_str());
+        }
+        constexpr const char kBlkPrefix[] = "enc.blocks.";
+        if (name.rfind(kBlkPrefix, 0) != 0) {
+            return false;
+        }
+        const size_t start = std::strlen(kBlkPrefix);
+        const size_t dot   = name.find('.', start);
+        if (dot == std::string::npos) {
+            return false;
+        }
+        const int blk_idx = std::atoi(name.substr(start, dot - start).c_str());
+        if (blk_idx < lo || blk_idx > hi) {
+            return false;
+        }
+        return match_block_role(name.substr(dot + 1), role_s);
+    }
+    if (pat.rfind("role:", 0) == 0) {
+        const std::string role = pat.substr(5);
+        if (role == "pre_encode.conv") {
+            return name.rfind("enc.pre_encode.conv.", 0) == 0 && name.find(".weight") != std::string::npos;
+        }
+        if (role == "pre_encode.out") {
+            return name == "enc.pre_encode.out.weight";
+        }
+        if (role == "pred.embed") {
+            return name == "pred.embed.weight";
+        }
+        if (role == "pred.lstm") {
+            return name.rfind("pred.lstm.", 0) == 0 &&
+                   (name.find(".Wx") != std::string::npos || name.find(".Wh") != std::string::npos);
+        }
+        if (role == "pred") {
+            return name.rfind("pred.", 0) == 0;
+        }
+        if (role == "joint.out") {
+            return name == "joint.out.weight";
+        }
+        if (role == "joint") {
+            return name.rfind("joint.", 0) == 0;
+        }
+        if (role == "vad") {
+            return name.rfind("vad.", 0) == 0 && name.find(".weight") != std::string::npos;
+        }
+        return false;
+    }
+    return name.find(pat) != std::string::npos;
+}
+
+bool load_rules_file(const char * path, std::vector<MixRule> & rules) {
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+        std::fprintf(stderr, "transcribe-quantize: cannot open rules file: %s\n", path);
+        return false;
+    }
+    std::string line;
+    int         lineno = 0;
+    while (std::getline(ifs, line)) {
+        ++lineno;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) {
+            line = line.substr(0, hash);
+        }
+        line = trim_copy(line);
+        if (line.empty()) {
+            continue;
+        }
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            std::fprintf(stderr, "transcribe-quantize: invalid rule at %s:%d (expected pattern=TYPE)\n", path, lineno);
+            return false;
+        }
+        MixRule r;
+        r.pattern            = trim_copy(line.substr(0, eq));
+        const std::string ts = trim_copy(line.substr(eq + 1));
+        if (!parse_ggml_type_name(ts, r.type)) {
+            std::fprintf(stderr, "transcribe-quantize: unknown type \"%s\" at %s:%d\n", ts.c_str(), path, lineno);
+            return false;
+        }
+        rules.push_back(std::move(r));
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Per-tensor requant
@@ -197,7 +425,7 @@ void move_bulk_kv_last(gguf_context * ctx) {
 
 void print_usage(const char * argv0) {
     std::fprintf(stderr,
-                 "usage: %s INPUT.gguf OUTPUT.gguf --quant PRESET\n"
+                 "usage: %s INPUT.gguf OUTPUT.gguf [--quant PRESET] [--rules FILE] [--squeeze-pw]\n"
                  "\n"
                  "  --quant PRESET   one of:",
                  argv0);
@@ -206,15 +434,19 @@ void print_usage(const char * argv0) {
     for (size_t i = 0; i < n; ++i) {
         std::fprintf(stderr, " %s", presets[i].name);
     }
-    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "\n  --rules FILE     mixed-precision rules file (pattern=TYPE)\n"
+                         "  --squeeze-pw     squeeze [1, in, out] conv pointwise weights to 2D [in, out]\n");
 }
 
 }  // namespace
 
 int main(int argc, char ** argv) {
-    const char * in_path  = nullptr;
-    const char * out_path = nullptr;
-    const char * quant    = nullptr;
+    const char *         in_path    = nullptr;
+    const char *         out_path   = nullptr;
+    const char *         quant      = nullptr;
+    const char *         rules_path = nullptr;
+    bool                 squeeze_pw = false;
+    std::vector<MixRule> mix_rules;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -224,6 +456,14 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             quant = argv[++i];
+        } else if (a == "--rules" || a == "-r") {
+            if (i + 1 >= argc) {
+                print_usage(argv[0]);
+                return 2;
+            }
+            rules_path = argv[++i];
+        } else if (a == "--squeeze-pw") {
+            squeeze_pw = true;
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -237,8 +477,14 @@ int main(int argc, char ** argv) {
             return 2;
         }
     }
-    if (in_path == nullptr || out_path == nullptr || quant == nullptr) {
+    if (in_path == nullptr || out_path == nullptr || (quant == nullptr && rules_path == nullptr)) {
         print_usage(argv[0]);
+        return 2;
+    }
+    if (quant == nullptr) {
+        quant = "F16";
+    }
+    if (rules_path != nullptr && !load_rules_file(rules_path, mix_rules)) {
         return 2;
     }
     const Preset * preset = find_preset(quant);
@@ -248,7 +494,8 @@ int main(int argc, char ** argv) {
         return 2;
     }
 
-    std::printf("transcribe-quantize: %s -> %s (preset %s)\n", in_path, out_path, preset->name);
+    std::printf("transcribe-quantize: %s -> %s (preset %s%s%s)\n", in_path, out_path, preset->name,
+                rules_path ? ", mixed rules" : "", squeeze_pw ? ", squeeze-pw" : "");
 
     // Load input gguf with tensor data into a ggml_context.
     //
@@ -287,6 +534,8 @@ int main(int argc, char ** argv) {
         ggml_tensor * src;
         ggml_type     dst_type;
         size_t        dst_nbytes;  // ggml_row_size(dst_type, ne0) * nrows
+        int           dst_ndims;
+        int64_t       dst_ne[GGML_MAX_DIMS];
     };
 
     std::vector<PlanEntry> plan;
@@ -304,24 +553,58 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const std::string name(t->name);
-        // Natively ternary tensors (GGML_TYPE_TQ1_G128) carry the exact
-        // weights the checkpoint was trained with at 1.75 bpw; every preset
-        // passes them through byte-for-byte and only re-types the rest.
-        const ggml_type   dst_type =
-            t->type == GGML_TYPE_TQ1_G128 ? GGML_TYPE_TQ1_G128 : resolve_target_type(*preset, name, t->ne[0]);
+        const Bucket      base_bucket = classify_tensor(name, t->ne[0]);
+        const bool        is_pw3d     = is_conformer_pw_name(name) && t->ne[0] == 1 && t->ne[2] > 1;
+        const int64_t     plan_ne0    = (squeeze_pw && is_pw3d) ? t->ne[1] : t->ne[0];
 
-        // ggml_row_size handles both block-quant and dense layouts.
-        // For multi-row tensors the total bytes is row_size * (nrows
-        // * higher_dims). We compute "all rows beyond ne[0]" by
-        // multiplying ne[1..3].
+        ggml_type dst_type = GGML_TYPE_COUNT;
+        if (t->type == GGML_TYPE_TQ1_G128) {
+            dst_type = GGML_TYPE_TQ1_G128;
+        } else {
+            for (const MixRule & r : mix_rules) {
+                if (match_mix_rule(name, base_bucket, r.pattern)) {
+                    dst_type = r.type;
+                    break;
+                }
+            }
+            if (dst_type == GGML_TYPE_COUNT) {
+                dst_type = resolve_target_type(*preset, name, plan_ne0);
+            }
+        }
+
+        const bool want_2d_pw =
+            is_pw3d && (squeeze_pw || ggml_is_quantized(dst_type) || dst_type == GGML_TYPE_BF16);
+
+        int     dst_ndims              = ggml_n_dims(t);
+        int64_t dst_ne[GGML_MAX_DIMS]  = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+        if (want_2d_pw) {
+            dst_ndims = 2;
+            dst_ne[0] = t->ne[1];
+            dst_ne[1] = t->ne[2];
+            dst_ne[2] = 1;
+            dst_ne[3] = 1;
+        }
+
+        if (const int64_t blk = ggml_blck_size(dst_type); blk > 1 && (dst_ne[0] % blk) != 0) {
+            dst_type = (dst_ne[0] % 32 == 0) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+        }
+
         int64_t nrows = 1;
         for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-            nrows *= t->ne[d];
+            nrows *= dst_ne[d];
         }
-        const size_t row_size = ggml_row_size(dst_type, t->ne[0]);
+        const size_t row_size = ggml_row_size(dst_type, dst_ne[0]);
         const size_t nb       = row_size * (size_t) nrows;
 
-        plan.push_back({ t, dst_type, nb });
+        PlanEntry pe_entry{};
+        pe_entry.src        = t;
+        pe_entry.dst_type   = dst_type;
+        pe_entry.dst_nbytes = nb;
+        pe_entry.dst_ndims  = dst_ndims;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            pe_entry.dst_ne[d] = dst_ne[d];
+        }
+        plan.push_back(pe_entry);
         total_data_bytes += nb;
         // Round up to ggml's alignment so each tensor starts on a
         // 32-byte boundary inside the output context buffer.
@@ -395,10 +678,8 @@ int main(int argc, char ** argv) {
         ggml_tensor * src = e.src;
 
         // Allocate the destination tensor in ctx_out with the new
-        // dtype and the same shape as the source. ggml_new_tensor
-        // handles arbitrary rank up to GGML_MAX_DIMS.
-        const int     n_dims = ggml_n_dims(src);
-        ggml_tensor * dst    = ggml_new_tensor(ctx_out, e.dst_type, n_dims, src->ne);
+        // dtype and the resolved (possibly 2D-squeezed) shape.
+        ggml_tensor * dst = ggml_new_tensor(ctx_out, e.dst_type, e.dst_ndims, e.dst_ne);
         if (dst == nullptr) {
             std::fprintf(stderr,
                          "transcribe-quantize: ggml_new_tensor failed for %s "
@@ -412,9 +693,7 @@ int main(int argc, char ** argv) {
         ggml_set_name(dst, src->name);
 
         // Cheap path: same dtype as source, just memcpy the bytes.
-        // Catches all the F32 norm/bias tensors when re-quantizing
-        // an f16 input, and the F16 conv kernels when quantizing an
-        // already-f16 input, etc.
+        // Squeezing [1, in, out] -> [in, out] preserves raw element order.
         if (src->type == dst->type) {
             std::memcpy(dst->data, src->data, ggml_nbytes(src));
             ++copied;
@@ -431,8 +710,7 @@ int main(int argc, char ** argv) {
             // Step 2: quantize fp32 → dst_type into the destination
             // tensor's data buffer. ggml_quantize_chunk takes (type,
             // src_fp32, dst_bytes, start_elem, nrows, n_per_row,
-            // imatrix). For our K-quants imatrix is unused; we only
-            // use types that don't require it.
+            // imatrix).
             if (ggml_quantize_requires_imatrix(dst->type)) {
                 std::fprintf(stderr,
                              "transcribe-quantize: type %s requires imatrix; "
@@ -443,10 +721,10 @@ int main(int argc, char ** argv) {
                 gguf_free(gguf_out);
                 return 1;
             }
-            const int64_t n_per_row = src->ne[0];
+            const int64_t n_per_row = e.dst_ne[0];
             int64_t       nrows     = 1;
             for (int d = 1; d < GGML_MAX_DIMS; ++d) {
-                nrows *= src->ne[d];
+                nrows *= e.dst_ne[d];
             }
             ggml_quantize_chunk(dst->type, fp32_scratch.data(), dst->data,
                                 /*start=*/0, nrows, n_per_row,

@@ -1,0 +1,13 @@
+# Mixed-Precision Recipe: hyb_attnQ8_ff1Q5K_ff2Q4K_pwQ4K (Champion, 430.8 MiB w/ PT+EN vocab surgery)
+# Usage:
+#   transcribe-quantize parakeet-ultra-pten-F16.gguf parakeet-ultra-pten-hyb-Q8_0-Q5_K-Q4_K.gguf \
+#     --quant Q4_K_M --squeeze-pw --rules scripts/quant_recipes/hyb_attnQ8_ff1Q5K_ff2Q4K_pwQ4K.rules
+
+role:pre_encode.conv=F16
+role:pre_encode.out=Q8_0
+blocks:0-23:attn=Q8_0
+blocks:0-23:ff1=Q5_K
+blocks:0-23:ff2=Q4_K
+blocks:0-23:pw=Q4_K
+role:pred=Q8_0
+role:joint=Q8_0

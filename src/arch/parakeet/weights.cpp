@@ -868,7 +868,7 @@ constexpr const char * kTag = kFamilyTag;
     do {                                                                                                         \
         const char *  _n = (name);                                                                               \
         ggml_tensor * _p = ggml_get_tensor(ctx_meta, _n);                                                        \
-        ggml_tensor * _t = (_p != nullptr && ggml_is_quantized(_p->type)) ?                                      \
+        ggml_tensor * _t = (_p != nullptr && (ggml_is_quantized(_p->type) || ggml_n_dims(_p) == 2)) ?           \
                                transcribe::weights::find_tensor(ctx_meta, _n, { TRANSCRIBE_QUANT_LINEAR_TYPES }, \
                                                                 { (in), (out) }, kTag) :                         \
                                transcribe::weights::find_tensor(ctx_meta, _n, { TRANSCRIBE_QUANT_CONV_TYPES },   \

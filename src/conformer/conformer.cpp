@@ -35,6 +35,46 @@ ggml_tensor * named(ggml_tensor * t, const char * name) {
     return t;
 }
 
+namespace {
+
+bool use_f16_acc() {
+    return transcribe::env::flag("TRANSCRIBE_PREC_F16");
+}
+
+ggml_type resolve_kv_type_override(ggml_type current) {
+    const char * env = transcribe::env::str("TRANSCRIBE_KV_TYPE");
+    if (env == nullptr || env[0] == '\0') {
+        return current;
+    }
+    if (std::strcmp(env, "f32") == 0 || std::strcmp(env, "F32") == 0) {
+        return GGML_TYPE_F32;
+    }
+    if (std::strcmp(env, "f16") == 0 || std::strcmp(env, "F16") == 0) {
+        return GGML_TYPE_F16;
+    }
+    if (std::strcmp(env, "bf16") == 0 || std::strcmp(env, "BF16") == 0) {
+        return GGML_TYPE_BF16;
+    }
+    if (std::strcmp(env, "q8_0") == 0 || std::strcmp(env, "Q8_0") == 0) {
+        return GGML_TYPE_Q8_0;
+    }
+    if (std::strcmp(env, "q4_0") == 0 || std::strcmp(env, "Q4_0") == 0) {
+        return GGML_TYPE_Q4_0;
+    }
+    if (std::strcmp(env, "q4_1") == 0 || std::strcmp(env, "Q4_1") == 0) {
+        return GGML_TYPE_Q4_1;
+    }
+    if (std::strcmp(env, "q5_0") == 0 || std::strcmp(env, "Q5_0") == 0) {
+        return GGML_TYPE_Q5_0;
+    }
+    if (std::strcmp(env, "q5_1") == 0 || std::strcmp(env, "Q5_1") == 0) {
+        return GGML_TYPE_Q5_1;
+    }
+    return current;
+}
+
+}  // namespace
+
 // LayerNorm with affine: y = gamma * (x - mean) / sqrt(var + eps) + beta.
 // ggml_norm normalizes along ne[0] (the d_model axis of [d_model, T, B]);
 // gamma/beta [d_model] broadcast over T and B. `gamma` required; `beta`
@@ -155,7 +195,7 @@ ggml_tensor * conv_1d_f32(ggml_context * ctx,
 
     // F32 accumulation when the kernel is F16 (see mul_mat_f32acc in
     // causal_lm.cpp for the CUDA COMPUTE_16F saturation rationale).
-    const bool kernel_needs_f32_acc = (kernel->type == GGML_TYPE_F16);
+    const bool kernel_needs_f32_acc = (kernel->type == GGML_TYPE_F16) && !use_f16_acc();
 
     if (N == 1) {
         // Single-shot path: flatten OW*N (== OW) and reshape the [OW, OC]
@@ -449,7 +489,7 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
     // they always take the direct mul_mat, whatever the backend default.
     const bool direct_pw = policy.direct_pw || B > 1;
 
-    if (direct_pw || ggml_is_quantized(b.conv_pw1_w->type)) {
+    if (direct_pw || ggml_is_quantized(b.conv_pw1_w->type) || ggml_n_dims(b.conv_pw1_w) == 2) {
         // Pointwise conv 1 as direct mul_mat in [d_model, T, B] layout.
         // Kernel ne=[1, d_model, 2*d_model] → reshape to [d_model, 2*d_model].
         // Force F32 accumulation for F16 weights (see mul_mat_f32acc in
@@ -461,7 +501,7 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
                                     b.conv_pw1_w :
                                     ggml_reshape_2d(ctx, b.conv_pw1_w, d_model, 2 * d_model);
             x                 = ggml_mul_mat(ctx, pw1, x);  // [2*d_model, T, B]
-            if (b.conv_pw1_w->type == GGML_TYPE_F16) {
+            if (b.conv_pw1_w->type == GGML_TYPE_F16 && !use_f16_acc()) {
                 ggml_prec_set_acc(x, GGML_PREC_F32);
             }
             if (b.conv_pw1_b != nullptr) {
@@ -611,7 +651,7 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
 
     x = ggml_silu(ctx, x);
 
-    if (direct_pw || ggml_is_quantized(b.conv_pw2_w->type)) {
+    if (direct_pw || ggml_is_quantized(b.conv_pw2_w->type) || ggml_n_dims(b.conv_pw2_w) == 2) {
         // Transpose back: [T, d_model] -> [d_model, T].
         x = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
 
@@ -620,7 +660,7 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
         ggml_tensor * pw2 =
             ggml_n_dims(b.conv_pw2_w) == 2 ? b.conv_pw2_w : ggml_reshape_2d(ctx, b.conv_pw2_w, d_model, d_model);
         x = ggml_mul_mat(ctx, pw2, x);
-        if (b.conv_pw2_w->type == GGML_TYPE_F16) {
+        if (b.conv_pw2_w->type == GGML_TYPE_F16 && !use_f16_acc()) {
             ggml_prec_set_acc(x, GGML_PREC_F32);
         }
         if (b.conv_pw2_b != nullptr) {
@@ -787,7 +827,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         const int left_pad       = params.window_left;
         ggml_type window_kv_type = GGML_TYPE_F32;
         if (use_flash) {
-            window_kv_type = kv_type;
+            window_kv_type = resolve_kv_type_override(kv_type);
             if (window_kv_type == GGML_TYPE_COUNT) {
                 window_kv_type = (b.attn_k_w->type != GGML_TYPE_F32) ? GGML_TYPE_F16 : GGML_TYPE_F32;
             }
@@ -1011,7 +1051,7 @@ ggml_tensor * rel_pos_mhsa(ggml_context *      ctx,
         // weights). The flash_attn accumulator is f32 internally
         // regardless of K/V type.
         {
-            ggml_type effective_kv = kv_type;
+            ggml_type effective_kv = resolve_kv_type_override(kv_type);
             if (effective_kv == GGML_TYPE_COUNT) {
                 effective_kv = (b.attn_k_w->type != GGML_TYPE_F32) ? GGML_TYPE_F16 : GGML_TYPE_F32;
             }
